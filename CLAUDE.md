@@ -89,11 +89,16 @@ page; both always run over the whole site.
    copied.
 5. `scripts/dev.js` reruns this whole build (with `--drafts`) on any change
    under `content/`, `templates/`, `styles/`, `assets/js`, `assets/img`,
-   `site.config.json` or `scripts/`, and serves `dist/` with clean URLs. In dev
-   (`NODE_ENV=development`) every root-relative `href`/`src` is rewritten with
-   a `/dist` prefix; absolute URLs (canonical, `og:*`, JSON-LD, sitemap, RSS)
-   are left untouched. `scripts/check.js` strips that same prefix back off
-   before checking that links resolve to real output files.
+   `site.config.json` or `scripts/`, and serves `dist/` with clean URLs. Every
+   root-relative `href`/`src` is written with `basePath()` from
+   `lib/content.js` as a prefix: `/dist` in dev (`NODE_ENV=development`),
+   `BASE_PATH` otherwise (the deploy workflow passes `/<repo>` for a GitHub
+   Pages project site, nothing on a custom domain). Absolute URLs (canonical,
+   `og:*`, JSON-LD, sitemap, RSS) come from `site.url`, which `SITE_URL`
+   overrides (the workflow passes the Pages address). `scripts/check.js` strips
+   the same prefix back off before checking that links resolve to real output
+   files. `CNAME` is only written when `site.url`'s host is `deploy.cname`, so a
+   copy published on github.io never claims the domain.
 6. `scripts/check.js` reloads the same content model, walks the built `dist/`
    tree, and errors on duplicate URLs or internal links/images pointing at
    files that don't exist; it warns on missing or overlong SEO fields, missing

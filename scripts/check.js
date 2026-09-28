@@ -10,7 +10,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, loadSite } from './lib/content.js';
+import { basePath, paths, loadSite } from './lib/content.js';
 
 if (!fs.existsSync(paths.dist)) {
   console.error('\n  dist/ does not exist. Run the build first.\n');
@@ -21,10 +21,11 @@ const { all, site } = loadSite();
 const errors = [];
 const warnings = [];
 
-// Mirrors scripts/build.js: in development every internal href/src is written
-// with a /dist prefix, so links must be stripped back to their real dist/
-// path before checking they resolve to a file that was actually written.
-const base = process.env.NODE_ENV === 'development' ? '/dist' : '';
+// Mirrors scripts/build.js: every internal href/src is written with the base
+// prefix (/dist in development, /<repo> on a Pages project site), so links
+// must be stripped back to their real dist/ path before checking they resolve
+// to a file that was actually written.
+const base = basePath();
 function stripBase(href) {
   return base && href.startsWith(base) ? href.slice(base.length) || '/' : href;
 }

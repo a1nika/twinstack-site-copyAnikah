@@ -272,8 +272,13 @@ around.
 ### GitHub Pages (workflow included)
 
 `.github/workflows/deploy.yml` builds, validates and deploys on every push to
-`main`. In repo settings, set Pages → Source → GitHub Actions. A `CNAME` file is
-written automatically from `site.config.json` → `deploy.cname`.
+the repository's default branch (`master` here). In repo settings, set Pages →
+Source → GitHub Actions (the Twinstack web app does this for copies it
+duplicates). Without a custom domain the site is published at
+`https://<owner>.github.io/<repo>/`, and the workflow builds every link under
+that path. Once a custom domain is set in Pages settings, the same workflow
+builds for the domain instead, and writes the `CNAME` file from
+`site.config.json` → `deploy.cname` when the two match.
 
 DNS for the apex domain:
 

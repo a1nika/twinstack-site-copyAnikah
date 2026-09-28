@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { TemplateEngine, escapeHtml } from './lib/template.js';
-import { loadSite, paths, outputPathFor, pick, markActive, ROOT } from './lib/content.js';
+import { basePath, loadSite, paths, outputPathFor, pick, markActive, ROOT } from './lib/content.js';
 import { renderMarkdown, excerpt } from './lib/markdown.js';
 import { buildJsonLd } from './lib/schema.js';
 import { buildCss } from './lib/css.js';
@@ -20,12 +20,12 @@ import { buildCss } from './lib/css.js';
 const args = new Set(process.argv.slice(2));
 const includeDrafts = args.has('--drafts') || args.has('--dev');
 
-// In development the site is often previewed from a server that serves this
-// whole project directory, so dist/ is reachable at /dist rather than at the
-// domain root. Every root-relative href/src gets that prefix; absolute URLs
-// (canonical, og:*, JSON-LD, sitemap, RSS) are untouched since they already
-// point at the real production domain.
-const base = process.env.NODE_ENV === 'development' ? '/dist' : '';
+// Every root-relative href/src gets this prefix: /dist in development (the
+// site is often previewed from a server that serves this whole project
+// directory), /<repo> on a GitHub Pages project site (see basePath()).
+// Absolute URLs (canonical, og:*, JSON-LD, sitemap, RSS) are built from
+// site.url instead, which already includes that path.
+const base = basePath();
 
 function withBase(html) {
   if (!base) return html;
@@ -205,7 +205,9 @@ function build() {
   write('robots.txt', `User-agent: *\nAllow: /\n\nSitemap: ${site.url}/sitemap.xml\n`);
   write('search-index.json', JSON.stringify(searchIndex));
 
-  if (site.deploy?.cname) write('CNAME', `${site.deploy.cname}\n`);
+  // Only when this build is for that domain: a copy published on github.io
+  // must not claim the template's domain.
+  if (site.deploy?.cname && new URL(site.url).hostname === site.deploy.cname) write('CNAME', `${site.deploy.cname}\n`);
   write('.nojekyll', '');
 
   const redirects = (data.redirects || [])
@@ -233,7 +235,7 @@ function build() {
     console.log(`    ${String(count).padStart(3)}  ${name}`);
   }
   if (includeDrafts) console.log('\n  (drafts and future-dated posts included)');
-  if (base) console.log(`  (NODE_ENV=development — internal links prefixed with ${base})`);
+  if (base) console.log(`  (internal links prefixed with ${base})`);
   console.log('');
 
   return { written, model };

@@ -185,8 +185,22 @@ function buildNavigation(navConfig, collections, site) {
   };
 }
 
+/**
+ * The prefix every root-relative href/src is written with. In development the
+ * site is often served from the project directory, so dist/ is at /dist. On a
+ * GitHub Pages project site it's at /<repo>, which the deploy workflow passes
+ * as BASE_PATH (empty on a custom domain).
+ */
+export function basePath() {
+  if (process.env.NODE_ENV === 'development') return '/dist';
+  return (process.env.BASE_PATH || '').replace(/\/+$/, '');
+}
+
 export function loadSite({ includeDrafts = false, includeFuture = false } = {}) {
   const site = readJson(path.join(ROOT, 'site.config.json'));
+  // The deploy workflow passes the address it publishes to (a github.io URL
+  // until a custom domain is set), for canonical links, the sitemap and RSS.
+  if (process.env.SITE_URL) site.url = process.env.SITE_URL.replace(/\/+$/, '');
   site.domain = site.url.replace(/^https?:\/\//, '').replace(/\/$/, '');
   site.year = new Date().getFullYear();
   site.buildTime = new Date().toISOString();
