@@ -1,12 +1,25 @@
 #!/usr/bin/env node
 /**
- * Modify one existing content or template file with Claude, from a plain
- * English instruction — for changes too specific to be worth a build-script
- * feature (add a section, restyle a block, tighten some copy) but too fiddly
- * to hand-edit template syntax for.
+ * Modify one existing content or template file with Claude. Two modes:
+ *
+ * Edit (default): apply a plain English instruction — for changes too
+ * specific to be worth a build-script feature (add a section, restyle a
+ * block, tighten some copy) but too fiddly to hand-edit template syntax for.
  *
  *   node scripts/edit-page.js <page> "<instruction>"   run this one edit now
  *   node scripts/edit-page.js <page> "<instruction>" --dry-run
+ *
+ * Generate (--generate): write a page's .md yourself — rough copy, notes,
+ * images, image URLs — then have Claude turn that draft into the finished
+ * page: structured, in house style, with the layout's frontmatter fields
+ * filled from the draft and every image placed with real alt text. Nothing
+ * that isn't in the draft is added. The instruction is optional extra
+ * direction.
+ *
+ *   node scripts/edit-page.js <page> --generate ["<extra direction>"]
+ *   node scripts/edit-page.js <page> --generate --dry-run
+ *
+ * The queue:
  *   node scripts/edit-page.js                          run every queued edit in
  *                                                       scripts/page-commands.json
  *   node scripts/edit-page.js --dry-run                same, print only
@@ -18,18 +31,27 @@
  *                            repo (e.g. assets/img/uploads/team.jpg, shown on
  *                            the site as /assets/img/uploads/team.jpg), a URL
  *                            is used as-is. Queue entries take an "images" list.
+ *                            With --generate, images already in the draft
+ *                            (![](…), <img src>, bare image paths and URLs,
+ *                            frontmatter image/logo) are found automatically.
  *   --proposal-out=<file>    with --dry-run: also save the proposed file as JSON
- *                            ({ file, content, problems, … }) at this path, so a
- *                            tool can show it and then write exactly that version.
+ *                            ({ file, mode, content, problems, warnings, … }) at
+ *                            this path, so a tool can show it and then write
+ *                            exactly that version.
  *
  * <page> is a content slug (e.g. "products"), a URL, or a file path under
- * content/ or templates/.
+ * content/ or templates/. --generate only takes a markdown page under content/.
  *
- * With no <page> argument, every { file, instruction } entry in
- * scripts/page-commands.json's "queue" is applied in order and removed from
- * the queue as it succeeds. With a <page> argument, that one edit runs
+ * With no <page> argument, every { file, instruction, images?, mode? } entry
+ * in scripts/page-commands.json's "queue" is applied in order and removed from
+ * the queue as it succeeds ("mode": "generate" runs a generate job, whose
+ * instruction may be empty). With a <page> argument, that one edit runs
  * immediately and scripts/page-commands.json is not touched — add entries to
  * the queue by hand.
+ *
+ * "Problems" (a cut-off reply, unbalanced template blocks, a lost image, a
+ * changed slug…) stop the file being written. "Warnings" are printed, but
+ * don't.
  *
  * Requires ANTHROPIC_API_KEY.
  */
@@ -38,13 +60,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT, readJson, loadSite } from './lib/content.js';
 import { parseFrontmatter } from './lib/markdown.js';
-import { resolveImages } from './lib/claude-writer.js';
+import { bannedPhraseWarnings, requestClaude, resolveImages, stripFence } from './lib/claude-writer.js';
 
-// ANTHROPIC_BASE_URL (the SDKs' variable) points at a proxy or a local mock.
-const API_URL = `${(process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '')}/v1/messages`;
 const COMMANDS_PATH = path.join(ROOT, 'scripts/page-commands.json');
-const DEFAULT_QUEUE_COMMENT = 'Queue of pending edits for `npm run page:edit` (no arguments). Each entry is one job: { file, instruction }. Running with no arguments processes every entry in order, writes each one, then removes it from this queue. Add entries by hand any time; running `npm run page:edit -- <page> "<instruction>"` with arguments applies that edit immediately instead and never touches this file.';
+const DEFAULT_QUEUE_COMMENT = 'Queue of pending edits for `npm run page:edit` (no arguments). Each entry is one job: { file, instruction }, optionally with "images": [...] and "mode": "generate" (turn the file\'s own draft into the finished page; the instruction may then be empty). Running with no arguments processes every entry in order, writes each one, then removes it from this queue. Add entries by hand any time; running `npm run page:edit -- <page> "<instruction>"` with arguments applies that edit immediately instead and never touches this file.';
 const EDITABLE_ROOTS = ['content', 'templates', 'styles/main.css', 'site.config.json'];
+const MAX_TOKENS = 16000;
+// Keeps the request well inside the API's 32 MB limit (base64 adds a third).
+const MAX_VISION_IMAGES = 20;
+const MAX_VISION_BYTES = 18 * 1024 * 1024;
+// Fields that decide where a page lives and whether it's published.
+const LOCKED_FIELDS = ['slug', 'url', 'layout', 'date', 'draft', 'order'];
 
 const argv = process.argv.slice(2);
 const flag = (name) => {
@@ -54,6 +80,7 @@ const flag = (name) => {
 };
 const positional = argv.filter((a) => !a.startsWith('--'));
 const dryRun = Boolean(flag('dry-run'));
+const generateFlag = Boolean(flag('generate'));
 const imageArgs = argv.filter((a) => a.startsWith('--image=')).map((a) => a.slice('--image='.length));
 const proposalOut = flag('proposal-out');
 
@@ -80,6 +107,7 @@ if (flag('list')) {
     console.log(`\n  Pending (${queue.length}):\n`);
     for (const job of queue) {
       console.log(`  file:        ${job.file}`);
+      if (job.mode === 'generate') console.log('  mode:        generate');
       console.log(`  instruction: ${job.instruction}\n`);
     }
   }
@@ -89,7 +117,7 @@ if (flag('list')) {
 /* ----------------------------------------------------------------- target */
 
 function resolveFile(pageArg) {
-  const direct = pageArg.replace(/\\/g, '/');
+  const direct = path.posix.normalize(String(pageArg).replace(/\\/g, '/')).replace(/^\.\//, '');
   if (
     direct.startsWith('content/') ||
     direct.startsWith('templates/') ||
@@ -110,23 +138,45 @@ function resolveFile(pageArg) {
 }
 
 function isEditable(relPath) {
+  // Normalised first, so "content/../.env" can't pass as a content file.
+  const normalised = path.posix.normalize(relPath);
+  if (normalised !== relPath || normalised.startsWith('../') || path.posix.isAbsolute(normalised)) return false;
   return EDITABLE_ROOTS.some((root) => relPath === root || relPath.startsWith(`${root}/`));
 }
 
-/* ----------------------------------------------------------------- prompt */
+/* ------------------------------------------------------- site knowledge */
 
-function buildPrompts(relFile, instruction, original, images = []) {
-  const isContent = relFile.startsWith('content/') && relFile.endsWith('.md');
+const listNames = (dir, ext) =>
+  fs.existsSync(dir)
+    ? fs.readdirSync(dir).filter((f) => f.endsWith(ext)).map((f) => f.slice(0, -ext.length)).sort()
+    : [];
 
-  const contextNote = isContent
-    ? `This file is a markdown content file. Its body is rendered as a template BEFORE markdown conversion, so template syntax works directly in the body. Variables in scope: site (site.config.json, e.g. site.contact.email, site.name), data.<jsonFileName> (every file in content/data/, e.g. data.faq, data.company, data.testimonials), nav (header.items/header.cta/footer/legal), page (this file's own frontmatter plus derived fields: title, description, url, tagline, content, headings, dateFormatted, readingTime...), and the full collections as flat lists usable directly in {{#each}}: pages, products, services, blog, caseStudies (each item has at least title, url, description, excerpt, tagline, image, date, dateFormatted, tags). Also in scope: faqItems, isHome, latestPosts (3 most recent blog posts, excluding this page), recentPosts (5 most recent blog posts, excluding this page), productPosts (up to 5 most recent blog posts whose relatedProduct frontmatter points at a /products/ page), otherProducts, otherServices, relatedItems. The template engine cannot slice or numerically compare inside {{#each}} — no "first N" of an arbitrary list. If you need a specific count that isn't already one of the pre-sliced lists above, loop the whole collection instead of inventing comparison logic that doesn't exist in this engine. Partials are available via {{> name }}, e.g. {{> stats }}, {{> testimonials }}, {{> cta }}, {{> faq }}.`
-    : relFile.startsWith('templates/')
-      ? `This file is an HTML template rendered with the same tiny template engine and the same context object described above for content files (site, data, nav, page, collections as pages/products/services/blog/caseStudies, faqItems, isHome, latestPosts, otherProducts, otherServices, relatedItems, plus {{> partial }} includes). It has no server-side logic beyond the engine's own syntax.`
-      : `This is a site-wide config or stylesheet file, not rendered through the template engine.`;
+const partialNames = () => listNames(path.join(ROOT, 'templates/partials'), '.html').filter((n) => n !== 'base');
+const dataNames = () => listNames(path.join(ROOT, 'content/data'), '.json');
 
-  const systemPrompt = `You edit one existing file in the source of ${site.name}'s static site (${site.description}). You will be given the file's full current contents and an instruction. Return the complete new file, and nothing else.
+/** The collection a content file belongs to, from site.config.json's dirs. */
+function collectionFor(relFile) {
+  const entries = Object.entries(site.collections || {})
+    .filter(([, c]) => typeof c.dir === 'string' && relFile.startsWith(`${c.dir.replace(/\/$/, '')}/`))
+    .sort((a, b) => b[1].dir.length - a[1].dir.length);
+  return entries[0] ? { name: entries[0][0], ...entries[0][1] } : null;
+}
 
-TEMPLATE ENGINE SYNTAX (only what exists — do not use anything not listed here)
+/** Every URL a page can link to: pages, collection indexes and the homepage. */
+function internalUrls() {
+  const urls = new Set(['/']);
+  try {
+    for (const entry of loadSite({ includeDrafts: true, includeFuture: true }).all) urls.add(entry.url);
+  } catch {
+    // A broken page elsewhere shouldn't stop this one being edited.
+  }
+  for (const collection of Object.values(site.collections || {})) {
+    if (collection.index?.url) urls.add(collection.index.url);
+  }
+  return [...urls].sort();
+}
+
+const TEMPLATE_SYNTAX = `TEMPLATE ENGINE SYNTAX (only what exists — do not use anything not listed here)
   {{ value }}                 escaped output
   {{{ value }}}               raw HTML output
   {{# if value }} … {{ else }} … {{/ if }}
@@ -148,18 +198,43 @@ with the item's own markdown line immediately after the opening tag, e.g.:
   {{# each recentPosts }}- [{{ title }}]({{ url }}) — {{ dateFormatted }}
   {{/ each }}
 (item text on the same line as the opening tag, closing tag on its own line)
-— not with a line break after the opening tag.
+— not with a line break after the opening tag.`;
 
-${contextNote}
+/** What a content body or template can reference, read from the site as it is now. */
+function contextVariables() {
+  const collections = Object.keys(site.collections || {}).join(', ');
+  const data = dataNames().map((n) => `data.${n}`).join(', ');
+  const partials = partialNames().map((n) => `{{> ${n} }}`).join(', ');
+  return `Variables in scope: site (site.config.json, e.g. site.contact.email, site.name), data.<jsonFileName> (every file in content/data/: ${data || 'none yet'}), nav (header.items/header.cta/footer/legal), page (this file's own frontmatter plus derived fields: title, description, url, tagline, content, headings, dateFormatted, readingTime...), and every collection as a flat list usable directly in {{#each}}: ${collections} (each item has at least title, url, description, excerpt, tagline, image, date, dateFormatted, tags). Also in scope: faqItems, isHome, latestPosts (3 most recent blog posts, excluding this page), recentPosts (5 most recent blog posts, excluding this page), productPosts (up to 5 most recent blog posts whose relatedProduct frontmatter points at a /products/ page), otherProducts, otherServices (up to 3), relatedItems. The template engine cannot slice or numerically compare inside {{#each}} — no "first N" of an arbitrary list. If you need a specific count that isn't already one of the pre-sliced lists above, loop the whole collection instead of inventing comparison logic that doesn't exist in this engine. The partials that exist are: ${partials || 'none'}. Never include one that isn't listed.`;
+}
 
-HOUSE RULES (from CLAUDE.md — follow these exactly)
+const HOUSE_RULES = `HOUSE RULES (from CLAUDE.md — follow these exactly)
 - Never hardcode a fact that appears, or could appear, on more than one page (contact details, stats, FAQ entries). Reference site.*, data.* or a collection instead.
 - Never hand-list content that a collection already provides (products, services, posts, case studies) — loop over the collection with {{#each}}.
 - Do not invent facts: statistics, client names, release numbers, or claims about Salesforce behaviour need to already be true of the codebase you can see. If unsure, describe the shape of the thing rather than quantifying it.
 - British spelling, sentence case headings, plain verbs. No exclamation marks, no "unlock", "seamless", "game-changing", "dive in".
 - Markdown content files: do not add a leading "# Title" heading — the layout renders the title separately.
+- Utilities belong inline in templates; only touch styles/main.css for tokens or patterns already repeated three or more times elsewhere, and never touch assets/css/main.css (it is compiled output).`;
+
+/* ------------------------------------------------------------ edit prompt */
+
+function buildEditPrompts(relFile, instruction, original, images = []) {
+  const isContent = relFile.startsWith('content/') && relFile.endsWith('.md');
+
+  const contextNote = isContent
+    ? `This file is a markdown content file. Its body is rendered as a template BEFORE markdown conversion, so template syntax works directly in the body. ${contextVariables()}`
+    : relFile.startsWith('templates/')
+      ? `This file is an HTML template rendered with the same template engine as content files. It has no server-side logic beyond the engine's own syntax. ${contextVariables()}`
+      : `This is a site-wide config or stylesheet file, not rendered through the template engine.`;
+
+  const systemPrompt = `You edit one existing file in the source of ${site.name}'s static site (${site.description}). You will be given the file's full current contents and an instruction. Return the complete new file, and nothing else.
+
+${TEMPLATE_SYNTAX}
+
+${contextNote}
+
+${HOUSE_RULES}
 - Preserve everything about the file that the instruction doesn't ask you to change: frontmatter fields and their order, unrelated sections, existing classes and structure, indentation style.
-- Utilities belong inline in templates; only touch styles/main.css for tokens or patterns already repeated three or more times elsewhere, and never touch assets/css/main.css (it is compiled output).
 
 OUTPUT
 Return only the raw contents of the new file, starting from its very first character (frontmatter's opening "---" for a content file). No commentary, no explanation, no surrounding code fence.`;
@@ -170,16 +245,16 @@ Return only the raw contents of the new file, starting from its very first chara
 ${original}
 ----- end current contents -----
 
-Instruction: ${instruction}${imagesNote(images)}`;
+Instruction: ${instruction}${editImagesNote(images)}`;
 
   return { systemPrompt, userPrompt, isContent };
 }
 
-/** The part of the prompt that tells Claude how to use the supplied images. */
-function imagesNote(images) {
+/** The part of an edit prompt that tells Claude how to use the supplied images. */
+function editImagesNote(images) {
   if (!images.length) return '';
   const list = images
-    .map((image, i) => `  ${i + 1}. ${image.ref}${image.block ? '' : ' (not shown to you: unsupported type or too large)'}`)
+    .map((image, i) => `  ${i + 1}. ${image.ref}${image.block ? '' : ` (not shown to you: ${image.why || 'unsupported type or too large'})`}`)
     .join('\n');
   return `
 
@@ -188,9 +263,195 @@ ${list}
 Use them where the instruction asks. Reference each one with exactly the path or URL listed, e.g. ![Alt text](${images[0].ref}). Write alt text that describes what the image actually shows. Never invent other image paths.`;
 }
 
+/* -------------------------------------------------------- generate prompt */
+
+const FRONTMATTER_SYNTAX = `FRONTMATTER SYNTAX (the site's own parser reads only these forms)
+  key: value                  one line; wrap the value in double quotes if it contains ": " or " #", or starts with a quote, [, {, >, |, - or *
+  key: [a, b, c]              an inline list of short plain values
+  key:                        a block list, one item per line, indented two spaces:
+    - First item
+  key:                        a list of objects, the object's other fields indented to line up:
+    - title: First
+      body: Text
+No multi-line strings (| or >), no nested lists, no inline {…} objects, no blank "key:" lines that aren't followed by a list.`;
+
+function buildGeneratePrompts(relFile, instruction, original, images, layoutInfo) {
+  const urls = internalUrls();
+  const imageList = images.length
+    ? images
+        .map((image, i) => {
+          const where = image.inFrontmatter ? ` — from frontmatter "${image.inFrontmatter}", keep it there` : '';
+          const seen = image.block
+            ? ''
+            : ` (not shown to you: ${image.why || 'unsupported type or too large'} — take its alt text from the draft's own words about it, not from other images)`;
+          return `  ${i + 1}. ${image.ref}${where}${seen}`;
+        })
+        .join('\n')
+    : '  None. The draft has no images, so add none.';
+
+  const systemPrompt = `You turn an author's draft into the finished page for ${site.name}'s website (${site.description}). The draft is an existing markdown content file: the author has written what the page should say, perhaps roughly — notes, pasted copy, lists, images and image URLs. Rewrite it into the complete, publishable file.
+
+WORKING FROM THE DRAFT — the most important rules here
+- The draft is your only source of facts. Keep every fact, figure, name, link and image the author included, and add none of your own: no statistics, clients, quotes, dates or claims that aren't in it. Don't add detail the draft doesn't contain even when it's plausible or generally true — no extra features, examples, reassurances ("no risk", "guaranteed"), outcomes or figures. If the draft is thin, write a short page rather than padding it.
+- Improve everything else: give it a clear structure with "##" (and if needed "###") section headings in a sensible order, turn rough notes into clear sentences, use a list where the material is a list and a table where it is a comparison, remove repetition.
+- Improving is rewording, not elaborating. A short phrase in the draft ("ship small") stays a short item; don't explain it with reasons or practices the draft doesn't give. In a table, a cell the draft says nothing about is "—", never a guess. Don't write a sentence to introduce an image or a section when the draft has nothing to say there.
+- The description of the company at the top of these instructions is background, not material: don't copy it into the page.
+- Keep the author's meaning, emphasis and tone. Where the draft already reads well, keep its wording.
+- Text addressed to the writer rather than the reader — HTML comments, lines starting "TODO", "Note:" or "Claude:", or [square-bracketed requests] — is an instruction: follow it, and leave it out of the page.
+- Keep existing links (with their URLs unchanged). Add a link only where it genuinely helps the reader, and only to a page from this list:
+${urls.map((u) => `    ${u}`).join('\n')}
+  Never invent a URL.
+
+FRONTMATTER
+- Keep every existing field and its value unless the draft's own notes ask for a change. Keep the title.
+- Never add, change or remove ${LOCKED_FIELDS.join(', ')}: the site derives them when they're missing, and changing them moves or unpublishes the page.
+- Fill in fields the layout reads (listed below) that are missing or empty, but only when the draft contains the material for them — for example a tagline, highlights, deliverables or steps. Material that has moved into such a field should not also be repeated in the body.
+- If description is missing or empty, write one: a plain sentence of at most 160 characters summarising the page.
+
+${FRONTMATTER_SYNTAX}
+
+THE PAGE'S LAYOUT
+This page renders through templates/layouts/${layoutInfo.name}.html. The layout already shows the title and hero above the body and any FAQ, call to action and related items after it, so the body must not repeat them. Fields this layout reads from the frontmatter: ${layoutInfo.fields.length ? layoutInfo.fields.join(', ') : 'none beyond title'}.
+----- templates/layouts/${layoutInfo.name}.html -----
+${layoutInfo.source || '(layout file not found)'}
+----- end layout -----
+
+IMAGES
+${imageList}
+- Every image listed must still appear in the file, referenced by exactly the path or URL listed (paths are root-relative, starting with "/"). Never invent or alter an image path.
+- The images you can see are attached above the draft, in the same order. Alt text says what is visibly in the image, specifically — never "image of", and never a meaning the draft doesn't give it (a chart with no labels is "a bar chart with three rising bars", not a claim about what it measures). For an image you can't see, base the alt text only on what the draft says about it.
+- Put each image where it fits the text around it. Use markdown for a plain image: ![Alt text](path). Add a caption only when the draft says what the image shows, and then only in the draft's terms, as an HTML block with blank lines before and after it and none inside it:
+<figure>
+  <img src="path" alt="Alt text" loading="lazy">
+  <figcaption>Caption</figcaption>
+</figure>
+
+${TEMPLATE_SYNTAX}
+
+This file's body is rendered as a template BEFORE markdown conversion, so template syntax works directly in the body. ${contextVariables()}
+
+${HOUSE_RULES}
+
+OUTPUT
+Before answering, check each sentence, list item and frontmatter value against the draft: if it states something the draft doesn't (a detail, qualifier, promise or next step), remove it. Then return only the raw contents of the finished file, starting with the opening "---" of the frontmatter. No commentary, no explanation, no surrounding code fence.`;
+
+  const userPrompt = `File: ${relFile}
+
+----- draft -----
+${original}
+----- end draft -----
+
+${instruction ? `Extra direction from the author: ${instruction}` : 'Turn this draft into the finished page.'}`;
+
+  return { systemPrompt, userPrompt, isContent: true };
+}
+
+/** The layout a content file renders with: its source and the page.* fields it reads. */
+function layoutFor(relFile, frontmatter) {
+  const name = String(frontmatter.layout || collectionFor(relFile)?.layout || 'page');
+  const file = path.join(ROOT, 'templates/layouts', `${name}.html`);
+  const source = /^[\w-]+$/.test(name) && fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim() : '';
+  const derived = new Set(['content', 'headings', 'url', 'absoluteUrl', 'slug', 'readingTime', 'dateFormatted', 'excerpt', 'body', 'parentLabel', 'parentUrl', 'collection', 'sourceFile']);
+  const fields = [...new Set([...source.matchAll(/\bpage\.([A-Za-z_]\w*)/g)].map((m) => m[1]))].filter((f) => !derived.has(f));
+  return { name, source, fields };
+}
+
+/* ----------------------------------------------------------------- images */
+
+const IMAGE_EXT = 'png|jpe?g|gif|webp|svg|avif';
+const FRONTMATTER_BLOCK = /^﻿?---\r?\n([\s\S]*?)\r?\n---[ \t]*(\r?\n|$)/;
+
+/**
+ * Every image a draft refers to, in order of appearance: frontmatter image/logo,
+ * ![](src), <img src>, and bare image URLs or assets/img/ paths on their own.
+ * Template expressions and data: URIs are left alone.
+ */
+function findDraftImages(text) {
+  const { data } = parseFrontmatter(text);
+  const found = [];
+  const add = (raw, index, inFrontmatter = null) => {
+    const value = String(raw).trim().replace(/^<|>$/g, '');
+    if (!value || value.includes('{{') || /^data:/i.test(value)) return;
+    if (!/^https?:\/\//i.test(value) && !new RegExp(`\\.(${IMAGE_EXT})$`, 'i').test(value.split(/[?#]/)[0])) return;
+    found.push({ value, index, inFrontmatter });
+  };
+
+  for (const key of ['image', 'logo']) {
+    if (typeof data[key] === 'string') add(data[key], -1, key);
+  }
+  const patterns = [
+    /!\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/g,
+    /<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/gi,
+    new RegExp(`(?:^|[\\s(])(https?:\\/\\/[^\\s)<>"'\\]]+?\\.(?:${IMAGE_EXT})(?:\\?[^\\s)<>"'\\]]*)?)(?=$|[\\s)<>"'\\]])`, 'gim'),
+    new RegExp(`(?:^|\\s)(\\/?assets\\/img\\/[\\w./-]+\\.(?:${IMAGE_EXT}))(?=$|\\s)`, 'gim'),
+  ];
+  const bodyStart = FRONTMATTER_BLOCK.exec(text)?.[0].length ?? 0;
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      if (match.index < bodyStart) continue; // frontmatter was handled above
+      add(match[1], match.index);
+    }
+  }
+
+  const seen = new Set();
+  return found
+    .sort((a, b) => a.index - b.index)
+    .filter(({ value }) => {
+      const key = canonicalImage(value);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+/** The form a page references an image by: URLs as-is, repo files as "/assets/…". */
+function canonicalImage(value) {
+  if (/^https?:\/\//i.test(value)) return value;
+  return `/${path.posix.normalize(value.replace(/\\/g, '/').replace(/^\/+/, ''))}`;
+}
+
+/** Resolves draft images and --image entries into { ref, block, why, inFrontmatter }. */
+function collectImages(entries) {
+  const images = [];
+  for (const entry of entries) {
+    const ref = canonicalImage(entry.value);
+    if (!/^https?:\/\//i.test(ref)) {
+      const relative = ref.slice(1);
+      if (relative.startsWith('../') || relative.split('/')[0] === '.git') {
+        console.log(`  ! image "${entry.value}" — outside the site's files, skipped entirely`);
+        continue;
+      }
+      if (!fs.existsSync(path.join(ROOT, relative))) {
+        images.push({ ref, block: null, why: 'file not found in the repo', missing: true, inFrontmatter: entry.inFrontmatter });
+        continue;
+      }
+    }
+    const [resolved] = resolveImages([entry.value]);
+    if (resolved) images.push({ ...resolved, inFrontmatter: entry.inFrontmatter });
+  }
+  return limitVision(images);
+}
+
+/** Past the request's limits, later images are named but not shown. */
+function limitVision(images) {
+  let count = 0;
+  let bytes = 0;
+  return images.map((image) => {
+    if (!image.block) return image;
+    const size = image.block.source.type === 'base64' ? image.block.source.data.length : 0;
+    if (count + 1 > MAX_VISION_IMAGES || bytes + size > MAX_VISION_BYTES) {
+      return { ...image, block: null, why: 'too many images to show in one request' };
+    }
+    count += 1;
+    bytes += size;
+    return image;
+  });
+}
+
 /** Text-only prompts stay a string; with images, each one is labelled and sent as vision input. */
 function userContent(userPrompt, images) {
-  if (!images.length) return userPrompt;
+  const shown = images.filter((image) => image.block);
+  if (!shown.length) return userPrompt;
   const blocks = [];
   images.forEach((image, i) => {
     if (image.block) blocks.push({ type: 'text', text: `Image ${i + 1}: ${image.ref}` }, image.block);
@@ -198,40 +459,83 @@ function userContent(userPrompt, images) {
   return [...blocks, { type: 'text', text: userPrompt }];
 }
 
-async function callClaude(systemPrompt, userPrompt) {
-  const response = await fetch(API_URL, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: site.automation.model,
-      max_tokens: 8000,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userPrompt }],
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Anthropic API ${response.status}: ${(await response.text()).slice(0, 400)}`);
+/**
+ * Asks Claude for the new file. If the API rejects a URL image it couldn't
+ * fetch, the request is retried once with URL images named but not shown.
+ */
+async function askClaude(buildPrompts, images) {
+  // The prompts describe which images are shown, so they're rebuilt for the retry.
+  const call = (list) => {
+    const { systemPrompt, userPrompt } = buildPrompts(list);
+    return requestClaude({ apiKey, model: site.automation.model, systemPrompt, userContent: userContent(userPrompt, list), maxTokens: MAX_TOKENS });
+  };
+  try {
+    return { ...(await call(images)), images };
+  } catch (error) {
+    const hasUrlImages = images.some((image) => image.block?.source.type === 'url');
+    if (error.status !== 400 || !hasUrlImages) throw error;
+    console.log(`  ! The API rejected the request (${error.message.slice(0, 160)}).`);
+    console.log('  ! Retrying with image URLs named but not shown, in case one of them couldn\'t be fetched.');
+    const fallback = images.map((image) =>
+      image.block?.source.type === 'url' ? { ...image, block: null, why: "the URL couldn't be fetched to show you" } : image,
+    );
+    return { ...(await call(fallback)), images: fallback };
   }
-
-  const payload = await response.json();
-  return payload.content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('')
-    .trim();
 }
 
-function stripFence(text) {
-  const fenced = text.match(/^```[a-z]*\n([\s\S]*)\n```$/);
-  return fenced ? fenced[1] : text;
+/* ----------------------------------------------------------------- checks */
+
+function balanceProblems(text) {
+  const openers = (text.match(/\{\{#\s*(if|unless|each)/g) || []).length;
+  const closers = (text.match(/\{\{\/\s*(if|unless|each)/g) || []).length;
+  return openers === closers ? [] : [`unbalanced template blocks (${openers} opened, ${closers} closed)`];
 }
 
-function sanityCheck(original, updated, isContent) {
+function partialProblems(text) {
+  const known = new Set(partialNames());
+  const used = [...new Set([...text.matchAll(/\{\{>\s*([\w-]+)\s*\}\}/g)].map((m) => m[1]))];
+  return used.filter((name) => !known.has(name)).map((name) => `includes a partial that doesn't exist: {{> ${name} }}`);
+}
+
+/** Frontmatter lines the site's parser would misread. Lines already in the original are left alone. */
+function frontmatterProblems(original, updated) {
+  const match = FRONTMATTER_BLOCK.exec(updated);
+  if (!match) return ['the frontmatter block ("---" … "---") is missing or unterminated'];
+  const before = new Set((FRONTMATTER_BLOCK.exec(original)?.[1] || '').split(/\r?\n/).map((l) => l.trimEnd()));
+
+  const problems = [];
+  let listOpen = false;
+  let mapItem = false;
+  for (const raw of match[1].split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const indent = line.length - line.trimStart().length;
+    const trimmed = line.trim();
+    let ok = true;
+
+    if (indent === 0) {
+      const kv = /^([A-Za-z0-9_.-]+):\s*(.*)$/.exec(trimmed);
+      const value = kv?.[2].trim() ?? '';
+      ok = Boolean(kv) && !/^[|>]/.test(value) && !/^\{/.test(value);
+      listOpen = Boolean(kv) && value === '';
+      mapItem = false;
+    } else if (trimmed.startsWith('- ')) {
+      ok = listOpen;
+      mapItem = /^- [A-Za-z0-9_.-]+:(\s|$)/.test(trimmed);
+    } else {
+      ok = mapItem && /^[A-Za-z0-9_.-]+:(\s|$)/.test(trimmed);
+    }
+
+    if (!ok && !before.has(line)) problems.push(`frontmatter line the site can't read: "${trimmed.slice(0, 80)}"`);
+  }
+  return problems;
+}
+
+function sameValue(a, b) {
+  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+}
+
+function editChecks(original, updated, isContent) {
   const problems = [];
 
   if (updated.length < original.length * 0.4) {
@@ -247,25 +551,75 @@ function sanityCheck(original, updated, isContent) {
     }
   }
 
-  const openers = (updated.match(/\{\{#\s*(if|unless|each)/g) || []).length;
-  const closers = (updated.match(/\{\{\/\s*(if|unless|each)/g) || []).length;
-  if (openers !== closers) problems.push(`unbalanced template blocks (${openers} opened, ${closers} closed)`);
+  problems.push(...balanceProblems(updated));
+  return { problems, warnings: [] };
+}
 
-  return problems;
+function generateChecks(original, updated, images) {
+  const problems = [];
+  const warnings = [];
+  const before = parseFrontmatter(original);
+  const after = parseFrontmatter(updated);
+
+  problems.push(...frontmatterProblems(original, updated));
+  if (!after.body.trim()) problems.push('the page has no body');
+  if (before.data.title && !after.data.title) problems.push('frontmatter lost its title');
+  for (const field of LOCKED_FIELDS) {
+    if (!sameValue(before.data[field], after.data[field])) {
+      problems.push(`"${field}" changed from ${JSON.stringify(before.data[field] ?? '(none)')} to ${JSON.stringify(after.data[field] ?? '(none)')}`);
+    }
+  }
+  if (before.data.title && after.data.title && before.data.title !== after.data.title) {
+    warnings.push(`title changed from "${before.data.title}" to "${after.data.title}"`);
+  }
+
+  // Each image from the draft must survive, and no image may appear from nowhere.
+  const escapedAmp = (ref) => ref.replace(/&/g, '&amp;');
+  for (const image of images) {
+    if (!updated.includes(image.ref) && !updated.includes(escapedAmp(image.ref))) {
+      problems.push(`an image from the draft is missing from the page: ${image.ref}`);
+    }
+    if (image.missing) warnings.push(`${image.ref} doesn't exist in the repo, so the page will show a broken image until it's added`);
+  }
+  const known = new Set(images.map((image) => image.ref));
+  for (const { value } of findDraftImages(updated)) {
+    const ref = canonicalImage(value);
+    const exists = /^https?:/i.test(ref) || fs.existsSync(path.join(ROOT, ref.slice(1)));
+    if (!known.has(ref) && !exists) problems.push(`uses an image that isn't in the draft or the repo: ${ref}`);
+  }
+
+  // Links to pages that don't exist are the author's call (the page may be coming), so they only warn.
+  const urls = new Set(internalUrls());
+  const links = [...updated.matchAll(/\]\((\/[^)\s]*)\)|\bhref=["'](\/[^"']*)["']/g)].map((m) => m[1] || m[2]);
+  for (const href of new Set(links)) {
+    const bare = href.split(/[?#]/)[0];
+    if (bare.startsWith('/assets/') || bare.includes('{{')) continue;
+    const candidates = [bare, bare.endsWith('/') ? bare : `${bare}/`, bare.replace(/\/$/, '')];
+    if (!candidates.some((c) => urls.has(c))) warnings.push(`links to a page that doesn't exist yet: ${href}`);
+  }
+
+  if (/^#\s/m.test(after.body)) warnings.push('the body has a "# " heading; the layout already shows the title');
+  if (/<!--|^\s*TODO\b/im.test(after.body)) warnings.push('the page still contains a comment or TODO note');
+  warnings.push(...bannedPhraseWarnings(after.body));
+
+  problems.push(...balanceProblems(updated), ...partialProblems(updated));
+  return { problems, warnings };
 }
 
 /* ------------------------------------------------------------- one edit --- */
 
-async function applyEdit(relFile, instruction, imageEntries = []) {
+async function applyEdit(relFile, instruction, imageEntries = [], mode = 'edit') {
+  const generate = mode === 'generate';
   console.log(`  File: ${relFile}`);
-  console.log(`  Instruction: ${instruction}`);
-  const images = resolveImages(imageEntries);
-  for (const [i, image] of images.entries()) {
-    console.log(`  Image ${i + 1}: ${image.ref}${image.block ? '' : ' (reference only)'}`);
-  }
+  console.log(`  Mode: ${generate ? 'generate the page from its draft' : 'edit by instruction'}`);
+  if (instruction) console.log(`  ${generate ? 'Direction' : 'Instruction'}: ${instruction}`);
 
   if (!isEditable(relFile)) {
     console.error(`  Won't touch "${relFile}" — outside content/, templates/, styles/main.css and site.config.json (dist/ and assets/css/main.css are generated, never edit them directly).\n`);
+    return false;
+  }
+  if (generate && !(relFile.startsWith('content/') && relFile.endsWith('.md'))) {
+    console.error(`  --generate works on a markdown page under content/, not "${relFile}".\n`);
     return false;
   }
 
@@ -276,7 +630,31 @@ async function applyEdit(relFile, instruction, imageEntries = []) {
   }
 
   const original = fs.readFileSync(targetPath, 'utf8');
-  const { systemPrompt, userPrompt, isContent } = buildPrompts(relFile, instruction, original, images);
+  if (generate && !parseFrontmatter(original).body.trim() && !instruction) {
+    console.error(`  ${relFile} has no draft to work from yet. Write the page's content in it first, or add a direction.\n`);
+    return false;
+  }
+
+  const entries = generate ? findDraftImages(original) : [];
+  for (const value of imageEntries) entries.push({ value, index: Infinity, inFrontmatter: null });
+  const seen = new Set();
+  const unique = entries.filter(({ value }) => !seen.has(canonicalImage(value)) && seen.add(canonicalImage(value)));
+  // A draft may name an image that's still to be added; an edit's --image must exist.
+  const images = collectImages(unique).filter((image) => {
+    if (generate || !image.missing) return true;
+    console.log(`  ! image "${image.ref}" — file not found, skipped entirely`);
+    return false;
+  });
+  for (const [i, image] of images.entries()) {
+    console.log(`  Image ${i + 1}: ${image.ref}${image.block ? '' : ` (reference only: ${image.why || 'not readable'})`}`);
+  }
+
+  const layout = generate ? layoutFor(relFile, parseFrontmatter(original).data) : null;
+  const buildPrompts = (list) =>
+    generate
+      ? buildGeneratePrompts(relFile, instruction, original, list, layout)
+      : buildEditPrompts(relFile, instruction, original, list);
+  const { systemPrompt, userPrompt, isContent } = buildPrompts(images);
 
   if (!apiKey) {
     console.log(`----- system prompt -----\n${systemPrompt}\n\n----- user prompt -----\n${userPrompt}\n`);
@@ -285,29 +663,39 @@ async function applyEdit(relFile, instruction, imageEntries = []) {
   }
 
   console.log(`  Model: ${site.automation.model}\n`);
-  const raw = stripFence(await callClaude(systemPrompt, userContent(userPrompt, images)));
-  const problems = sanityCheck(original, raw, isContent);
+  const reply = await askClaude(buildPrompts, images);
+  if (reply.stopReason === 'refusal') {
+    console.error('  Claude declined this request. Rephrase the draft or the instruction and try again.\n');
+    return false;
+  }
+  const raw = stripFence(reply.text);
+  const checked = generate ? generateChecks(original, raw, reply.images) : editChecks(original, raw, isContent);
+  const problems = [...checked.problems];
+  const { warnings } = checked;
+  if (reply.stopReason === 'max_tokens') problems.unshift(`Claude's reply was cut off at ${MAX_TOKENS} tokens, so the file is incomplete`);
 
   if (dryRun) {
     console.log(`----- proposed ${relFile} (not written) -----\n`);
     console.log(raw);
-    if (problems.length) console.log(`\n  warning: ${problems.join('\n  warning: ')}`);
-    if (proposalOut) writeProposal({ relFile, instruction, images, raw, problems });
+    if (problems.length) console.log(`\n  problem: ${problems.join('\n  problem: ')}`);
+    if (warnings.length) console.log(`\n  warning: ${warnings.join('\n  warning: ')}`);
+    if (proposalOut) writeProposal({ relFile, mode, instruction, images: reply.images, raw, problems, warnings });
     return false;
   }
 
   if (problems.length) {
-    console.error(`\n  Refused to write — looked wrong:\n${problems.map((p) => `    - ${p}`).join('\n')}\n\n  Re-run with --dry-run to inspect the output, or rephrase the instruction.\n`);
+    console.error(`\n  Refused to write — looked wrong:\n${problems.map((p) => `    - ${p}`).join('\n')}\n\n  Re-run with --dry-run to inspect the output, or rephrase the ${generate ? 'draft' : 'instruction'}.\n`);
     return false;
   }
 
   fs.writeFileSync(targetPath, raw.endsWith('\n') ? raw : `${raw}\n`);
+  for (const warning of warnings) console.log(`  warning: ${warning}`);
   console.log(`\n  Wrote ${relFile}  (${original.split('\n').length} -> ${raw.split('\n').length} lines)\n`);
   return true;
 }
 
 /** Saves a dry-run's proposed file for tools that show it and then write exactly that version. */
-function writeProposal({ relFile, instruction, images, raw, problems }) {
+function writeProposal({ relFile, mode, instruction, images, raw, problems, warnings }) {
   const target = path.resolve(ROOT, String(proposalOut));
   if (!target.startsWith(ROOT + path.sep)) {
     console.error(`  --proposal-out must be inside the repository, not ${proposalOut}.`);
@@ -315,10 +703,12 @@ function writeProposal({ relFile, instruction, images, raw, problems }) {
   }
   const proposal = {
     file: relFile,
+    mode,
     instruction,
     images: images.map((image) => image.ref),
     content: raw.endsWith('\n') ? raw : `${raw}\n`,
     problems,
+    warnings,
     model: site.automation.model,
     createdAt: new Date().toISOString(),
   };
@@ -329,14 +719,14 @@ function writeProposal({ relFile, instruction, images, raw, problems }) {
 
 /* -------------------------------------------------------------------- run */
 
-async function runAdHoc(pageArg, instruction) {
+async function runAdHoc(pageArg, instruction, mode) {
   const relFile = resolveFile(pageArg);
   if (!relFile) {
     console.error(`\n  Could not resolve "${pageArg}" to a file.\n`);
     process.exit(1);
   }
 
-  const ok = await applyEdit(relFile, instruction, imageArgs);
+  const ok = await applyEdit(relFile, instruction, imageArgs, mode);
   if (!dryRun) {
     console.log(ok ? `  Review with: git diff -- ${relFile}\n  Validate with: npm run check\n` : '');
     process.exit(ok ? 0 : 3);
@@ -364,7 +754,14 @@ async function runQueue() {
 
   for (const job of queue) {
     console.log('  ----------------------------------------');
-    const ok = await applyEdit(job.file, job.instruction, Array.isArray(job.images) ? job.images : []);
+    const mode = job.mode === 'generate' ? 'generate' : 'edit';
+    let ok = false;
+    if (mode === 'edit' && !job.instruction) {
+      console.error(`  ${job.file}: a queued edit needs an instruction (or "mode": "generate").\n`);
+    } else {
+      const relFile = (job.file && resolveFile(job.file)) || String(job.file || '');
+      ok = await applyEdit(relFile, job.instruction || '', Array.isArray(job.images) ? job.images : [], mode);
+    }
 
     if (dryRun) {
       remaining.shift();
@@ -392,13 +789,15 @@ async function runQueue() {
 
 if (positional.length) {
   const [pageArg, instructionArg] = positional;
-  const instruction = instructionArg || flag('instruction');
-  if (!instruction) {
+  const instruction = instructionArg || (typeof flag('instruction') === 'string' ? flag('instruction') : '');
+  const mode = generateFlag ? 'generate' : 'edit';
+  if (!instruction && mode === 'edit') {
     console.error(`
   Usage:
-    node scripts/edit-page.js <page> "<instruction>"
-    node scripts/edit-page.js                 run every queued edit
-    node scripts/edit-page.js --list          show the queue
+    node scripts/edit-page.js <page> "<instruction>"          edit by instruction
+    node scripts/edit-page.js <page> --generate ["<direction>"]  turn the page's draft into the finished page
+    node scripts/edit-page.js                                 run every queued edit
+    node scripts/edit-page.js --list                          show the queue
 `);
     process.exit(1);
   }
@@ -406,7 +805,7 @@ if (positional.length) {
     console.error('\n  ANTHROPIC_API_KEY is not set. Add it to your environment or repository secrets.\n');
     process.exit(1);
   }
-  runAdHoc(pageArg, instruction).catch((error) => {
+  runAdHoc(pageArg, instruction, mode).catch((error) => {
     console.error(`\n  Edit failed: ${error.message}\n`);
     process.exit(1);
   });

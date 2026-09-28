@@ -38,9 +38,15 @@ export function resolveImages(images = []) {
       continue;
     }
 
-    const relative = entry.replace(/^\/+/, '');
+    const relative = path.posix.normalize(entry.replace(/\\/g, '/').replace(/^\/+/, ''));
     const absolute = path.join(ROOT, relative);
     const publicRef = `/${relative}`;
+
+    // Paths come from hand-written markdown too, so they must stay inside the repo.
+    if (relative.startsWith('../') || relative === '..' || relative.split('/')[0] === '.git') {
+      console.log(`  ! image "${entry}" — outside the site's files, skipped entirely`);
+      continue;
+    }
     const ext = path.extname(relative).toLowerCase();
     const mediaType = MEDIA_TYPES[ext];
 
@@ -75,9 +81,19 @@ export function stripFence(text) {
  * content blocks (e.g. text + image blocks for vision).
  */
 export async function callClaude({ apiKey, model, systemPrompt, userContent, research }) {
+  const { text } = await requestClaude({ apiKey, model, systemPrompt, userContent, research, maxTokens: 4000 });
+  return text;
+}
+
+/**
+ * The same call, also returning why Claude stopped ("end_turn", or
+ * "max_tokens" when the reply was cut off). A failed request throws an Error
+ * with the HTTP `status` on it.
+ */
+export async function requestClaude({ apiKey, model, systemPrompt, userContent, research, maxTokens = 4000 }) {
   const body = {
     model,
-    max_tokens: 4000,
+    max_tokens: maxTokens,
     system: systemPrompt,
     messages: [{ role: 'user', content: userContent }],
   };
@@ -90,11 +106,14 @@ export async function callClaude({ apiKey, model, systemPrompt, userContent, res
   });
 
   if (!response.ok) {
-    throw new Error(`Anthropic API ${response.status}: ${(await response.text()).slice(0, 400)}`);
+    const error = new Error(`Anthropic API ${response.status}: ${(await response.text()).slice(0, 400)}`);
+    error.status = response.status;
+    throw error;
   }
 
   const payload = await response.json();
-  return payload.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+  const text = payload.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+  return { text, stopReason: payload.stop_reason ?? null };
 }
 
 /** Strips any root-relative markdown link that doesn't match a real URL,

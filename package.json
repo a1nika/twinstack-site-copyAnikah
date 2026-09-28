@@ -23,7 +23,12 @@
     "nav:remove": "node scripts/nav-remove.js",
     "page:edit": "node --env-file-if-exists=.env scripts/edit-page.js",
     "page:edit:preview": "node --env-file-if-exists=.env scripts/edit-page.js --dry-run",
-    "page:edit:list": "node --env-file-if-exists=.env scripts/edit-page.js --list"
+    "page:edit:list": "node --env-file-if-exists=.env scripts/edit-page.js --list",
+    "page:generate": "node --env-file-if-exists=.env scripts/edit-page.js --generate",
+    "page:generate:preview": "node --env-file-if-exists=.env scripts/edit-page.js --generate --dry-run",
+    "md:edit": "node --env-file-if-exists=.env scripts/edit-md.js",
+    "md:edit:preview": "node --env-file-if-exists=.env scripts/edit-md.js --dry-run",
+    "md:edit:list": "node scripts/edit-md.js --list"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.3",

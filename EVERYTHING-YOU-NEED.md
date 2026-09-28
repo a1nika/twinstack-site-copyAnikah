@@ -63,7 +63,7 @@ Work through this list. Items marked **required** block go-live.
 
 | # | Item | Where it goes | Notes |
 | --- | --- | --- | --- |
-| 1 | **Anthropic API key** (required for scheduled/AI-assisted content) | GitHub repo secret named `ANTHROPIC_API_KEY`, and `.env` locally | Create at console.anthropic.com. Used by `npm run scaffold:schedule` and `npm run page:edit`. |
+| 1 | **Anthropic API key** (required for scheduled/AI-assisted content) | GitHub repo secret named `ANTHROPIC_API_KEY`, and `.env` locally | Create at console.anthropic.com. Used by `npm run scaffold:schedule`, `npm run page:edit` and `npm run page:generate`. |
 | 2 | **GitHub repository** (required) | Push this folder to it | Private or public both work. |
 | 3 | **Hosting** (required) | GitHub Pages workflow is included; Cloudflare Pages and Netlify instructions in §6 | |
 | 4 | **DNS control for twinstack.net** (required) | See §6 | You are moving an existing live site, so plan the cutover. |
@@ -114,7 +114,7 @@ git push -u origin main
 
 # 5. In GitHub: Settings → Pages → Source: GitHub Actions.
 #    Settings → Secrets and variables → Actions → New secret:
-#       ANTHROPIC_API_KEY = sk-ant-... (only needed for scaffold:schedule / page:edit)
+#       ANTHROPIC_API_KEY = sk-ant-... (only needed for scaffold:schedule / page:edit / page:generate)
 ```
 
 Then point DNS (§6) once you are happy with the preview deployment.
@@ -374,7 +374,7 @@ grows, in the order you will want it.
 | `Tailwind CLI not found` | `npm install` has not been run in this checkout. CI runs `npm ci`. |
 | A new class does nothing | The CSS was built before the template change, or the file is outside the scanned sources in `styles/main.css`. Rebuild. |
 | A style disappears after deploy | It was added by hand to `assets/css/main.css`, which is generated. Put it in `styles/main.css`. |
-| `scaffold:schedule` or `page:edit` fails with 401 | `ANTHROPIC_API_KEY` is missing or expired. |
+| `scaffold:schedule`, `page:edit` or `page:generate` fails with 401 | `ANTHROPIC_API_KEY` is missing or expired. |
 
 ---
 

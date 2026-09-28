@@ -48,6 +48,11 @@ npm run page:edit:preview -- <page> "<instruction>" # same, print only, write no
 npm run page:edit                                  # run every queued edit in scripts/page-commands.json
 npm run page:edit:preview                          # same, print only, write nothing
 npm run page:edit:list                             # list the pending queue, run nothing
+npm run page:generate -- <page> ["<direction>"]    # Claude turns the page's own draft (.md) into the finished page
+npm run page:generate:preview -- <page>            # same, print only, write nothing
+npm run md:edit -- <file.md> "<instruction>"       # edit a markdown file outside content/ with Claude
+npm run md:edit:preview -- <file.md> "<instruction>" # same, print only, write nothing
+npm run md:edit:list                               # list the markdown files md:edit can change
 ```
 
 There is no separate lint or test suite — `npm run check` (build + link/URL/SEO
@@ -162,11 +167,38 @@ npm run page:edit -- products "Add a short section listing the 5 most recent blo
 
 `<page>` is a content slug, a URL, or a path under `content/` or `templates/`.
 `scripts/edit-page.js` reads the whole file, sends it to Claude with the
-frontmatter reference, the template engine syntax and the context variables
-available to that file (see `scripts/edit-page.js` for the full list —
-`recentPosts`/`latestPosts` etc.), and writes back the complete file. It
-refuses to write if the result looks truncated, drops a required frontmatter
-field, or has unbalanced `{{#if}}`/`{{#each}}` blocks.
+template engine syntax and the context variables available to that file
+(collections, `content/data/` files and partials are read from the site as it
+is, so new ones reach the prompt automatically), and writes back the complete
+file. It refuses to write if Claude's reply was cut off at the token limit,
+looks truncated, drops a required frontmatter field, or has unbalanced
+`{{#if}}`/`{{#each}}` blocks.
+
+**Write a page yourself, then let Claude finish it**
+
+```bash
+npm run page:generate:preview -- permission-audit
+npm run page:generate -- permission-audit "Keep it to three sections"
+```
+
+Write the page's `.md` the way you'd brief a writer: rough copy, pasted text,
+lists, `![](…)` images, `<img src>`, bare image URLs or `assets/img/…` paths,
+and notes to the writer (`<!-- … -->`, `TODO`, `[note: …]`). `--generate`
+sends that draft to Claude together with the page's layout template, so
+Claude fills the frontmatter fields the layout renders (a service's
+`tagline`, `deliverables`, `steps`…) from the draft, writes the body in house
+style and places every image with alt text. Every image in the draft is found
+automatically and sent as vision input (up to 20, 18 MB). If the API can't
+download an image URL, the request is retried with that URL named but not
+shown. The draft is the only source of facts: Claude is told to add none.
+Its reply is checked before anything is written. These **problems** block the
+write: a changed or added `slug`, `url`, `layout`, `date`, `draft` or `order`;
+an image from the draft that's missing, or one that appears from nowhere; a
+partial that doesn't exist; frontmatter the site's parser can't read; a reply
+cut off at the token limit. **Warnings** are printed but don't block: links to
+pages that don't exist, leftover notes, a `# ` heading, banned phrases, a
+draft image that isn't in the repo yet. Queue entries take
+`"mode": "generate"`, and then the instruction may be empty.
 
 Pass `--image=<path|url>` (repeatable) to give Claude images to look at and
 place in the page. A path is a file in the repo, such as
@@ -174,9 +206,12 @@ place in the page. A path is a file in the repo, such as
 `/assets/img/uploads/team.jpg`. A URL is used as-is. Both are sent as vision
 input through `resolveImages()` in `scripts/lib/claude-writer.js`, and queue
 entries accept an `images` list. With `--dry-run`,
-`--proposal-out=<file>` also saves the complete proposed file as JSON. The
-Twinstack web app uses it to show the preview and then write exactly that
-version. `ANTHROPIC_BASE_URL` overrides the API host for a proxy or a mock.
+`--proposal-out=<file>` also saves the complete proposed file as JSON
+(`file`, `mode`, `content`, `problems`, `warnings`…). The Twinstack web app
+uses it to show the preview and then write exactly that version, and it
+detects what a copy supports by searching `edit-page.js` for the literal
+strings `--proposal-out` and `--generate`, so keep both in the file.
+`ANTHROPIC_BASE_URL` overrides the API host for a proxy or a mock.
 
 Run with no `<page>` argument and it works through the queue in
 `scripts/page-commands.json` instead — a list of `{ file, instruction }` jobs,
@@ -185,6 +220,32 @@ to that file by hand any time; `npm run page:edit:list` prints what's pending
 without running anything. A `<page>` argument on the command line always runs
 that one edit immediately and never touches the queue file. Always
 `npm run check` afterwards.
+
+**Edit other markdown files with Claude**
+
+```bash
+npm run md:edit:preview -- scripts/site-tree.md "Add a careers page after faq.html"
+npm run md:edit -- scripts/scaffold-schedule.md "Add a blog job for 2 November about field history limits"
+```
+
+`scripts/edit-md.js` is `page:edit` for markdown outside `content/`:
+`scripts/site-tree.md`, `scripts/scaffold-schedule.md`,
+`scripts/site-tree-content/*.md` and the docs. It refuses `content/` (use
+`page:edit`), `dist/`, `node_modules/`, `static/`, dot-directories,
+`CHANGELOG.md` and files over 40 KB. Claude returns the whole file, and the
+file's line endings are kept. These **problems** block the write: a reply cut
+off at the token limit, an empty reply, an unclosed ``` fence, frontmatter
+that lost its closing `---`, a schedule job list that no longer parses
+(`scripts/lib/schedule-jobs.js`, shared with `scaffold-schedule.js`), and a
+site tree with no page lines left. **Warnings**: pages added to or removed
+from the tree, a changed job count, a done job that changed, a file that
+shrank by half. `--dry-run --proposal-out=<file>` saves the proposal with
+`"mode": "markdown"`, which is how the Twinstack web app previews it. The web
+app only offers the command when `scripts/edit-md.js` exists, and otherwise
+installs `scripts/edit-md.js` and `scripts/lib/schedule-jobs.js` from this
+repo's default branch into older copies. So `edit-md.js` imports only `ROOT`
+and `readJson` from `lib/content.js` plus `lib/schedule-jobs.js`, and keeps its
+own API call and site-tree parser: don't make it import anything newer.
 
 **Scaffold the whole page tree, or schedule pages for later**
 
