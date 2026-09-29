@@ -6,6 +6,139 @@ Tracking changes committed since 2026-09-23. Regenerated on every
 readable trail, not a rollback tool: to actually undo something, use `git
 log` and `git revert`/`git checkout` as normal.
 
+## 2026-09-28 — feat: publish website on push
+
+by Twin Stack
+
+- modified: `.github/workflows/deploy.yml`
+- modified: `CLAUDE.md`
+- modified: `EVERYTHING-YOU-NEED.md`
+- modified: `scripts/build.js`
+- modified: `scripts/check.js`
+- modified: `scripts/lib/content.js`
+
+## 2026-09-28 — add: edit with claude
+
+by Twin Stack
+
+- modified: `CLAUDE.md`
+- modified: `EVERYTHING-YOU-NEED.md`
+- modified: `package.json`
+- added: `scripts/edit-md.js`
+- modified: `scripts/edit-page.js`
+- modified: `scripts/lib/claude-writer.js`
+- added: `scripts/lib/schedule-jobs.js`
+- modified: `scripts/page-commands.json`
+- modified: `scripts/scaffold-schedule.js`
+
+## 2026-09-24 — mod: editing with claude
+
+by Twin Stack
+
+- modified: `CLAUDE.md`
+- modified: `scripts/edit-page.js`
+- modified: `scripts/lib/claude-writer.js`
+
+## 2026-09-24 — mod: clean structure
+
+by Twin Stack
+
+- modified: `content/data/navigation.json`
+- deleted: `content/hello/sample-entry.md`
+- deleted: `content/pages/hello.md`
+- deleted: `content/services/new-service.md`
+- modified: `scripts/site-tree.md`
+
+## 2026-09-24 — merge dev into master
+
+by Twin Stack
+
+_no file changes recorded_
+
+## 2026-09-24 — Merge branch 'master' of github.com:DemoProjectDjango/twinstack-site
+
+by Twin Stack
+
+_no file changes recorded_
+
+## 2026-09-24 — undo: last commit
+
+by Twin Stack
+
+- modified: `content/data/navigation.json`
+- added: `content/hello/sample-entry.md`
+- added: `content/pages/hello.md`
+- added: `content/services/new-service.md`
+- added: `scripts/site-tree.md`
+- modified: `site.config.json`
+- added: `templates/layouts/hello.html`
+- added: `templates/layouts/list-hello.html`
+
+## 2026-09-24 — new commit
+
+by Ibnul Ashir
+
+- modified: `content/data/navigation.json`
+- added: `content/hello/sample-entry.md`
+- added: `content/pages/hello.md`
+- added: `content/services/new-service.md`
+- added: `scripts/site-tree.md`
+- modified: `site.config.json`
+- added: `templates/layouts/hello.html`
+- added: `templates/layouts/list-hello.html`
+
+## 2026-09-23 — fix: header and footer styling
+
+by Twin Stack
+
+- modified: `scripts/build.js`
+
+## 2026-09-23 — mod: static header and footer
+
+by Twin Stack
+
+- modified: `scripts/build.js`
+- modified: `scripts/lib/content.js`
+- modified: `scripts/scaffold-schedule.js`
+
+## 2026-09-23 — fix: parsing error
+
+by Twin Stack
+
+- renamed: `content/_scheduled/john-wick.html -> content/_scheduled/john-wick2.html`
+- modified: `scripts/scaffold-schedule.js`
+- modified: `scripts/scaffold-schedule.md`
+
+## 2026-09-23 — mod: header and footer
+
+by Twin Stack
+
+- modified: `.env.example`
+- deleted: `.github/workflows/queue-health.yml`
+- deleted: `.github/workflows/weekly-blog.yml`
+- modified: `CHANGELOG.md`
+- modified: `CLAUDE.md`
+- modified: `EVERYTHING-YOU-NEED.md`
+- modified: `README.md`
+- deleted: `content/data/blog-queue.json`
+- modified: `content/data/navigation.json`
+- modified: `package.json`
+- modified: `scripts/build.js`
+- modified: `scripts/edit-page.js`
+- deleted: `scripts/generate-post.js`
+- modified: `scripts/lib/claude-writer.js`
+- modified: `scripts/lib/content.js`
+- modified: `scripts/lib/scaffold-tree-runner.js`
+- modified: `scripts/nav-remove.js`
+- modified: `scripts/nav.js`
+- modified: `scripts/scaffold-schedule.js`
+- modified: `scripts/scaffold-schedule.md`
+- modified: `scripts/scaffold-tree.js`
+- added: `scripts/site-tree-content/contact.md`
+- modified: `scripts/site-tree.md`
+- modified: `site.config.json`
+- modified: `templates/partials/header.html`
+
 ## 2026-09-23 — Make home.html a generic renderer of a data-driven section list
 
 by Twin Stack
